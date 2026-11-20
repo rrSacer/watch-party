@@ -129,10 +129,11 @@ function applyState(s, lat) {
     if (!s.playing) {
       v.playbackRate = 1;
       if (!v.paused) v.pause();
-      if (Math.abs(diff) > 0.1) remoteSeek(target);
+      // Em espera por buffering, tolera até 1s para não pular de volta e travar de novo (ciclo de buffering).
+      if (Math.abs(diff) > (s.waiting && s.waiting.length ? 1 : 0.1)) remoteSeek(target);
       return;
     }
-    if (Math.abs(diff) > 1 || (v.paused && Math.abs(diff) > 0.3)) { v.playbackRate = 1; remoteSeek(target); }
+    if (Math.abs(diff) > 1) { v.playbackRate = 1; remoteSeek(target); }
     else if (Math.abs(diff) > 0.15) v.playbackRate = diff > 0 ? 1.06 : 0.94;
     else v.playbackRate = 1;
     if (v.paused) {
