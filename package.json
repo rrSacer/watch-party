@@ -1,0 +1,14 @@
+{
+  "name": "watch-party",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "ws": "^8.23.0"
+  }
+}
