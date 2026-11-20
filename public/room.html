@@ -150,7 +150,12 @@ $('file').onchange = (e) => upload(e.target.files[0]);
 $('swapFile').onchange = (e) => upload(e.target.files[0]);
 $('subFile').onchange = (e) => upload(e.target.files[0], 'sub');
 
-$('copy').onclick = () => { navigator.clipboard.writeText(location.href); $('copy').textContent = 'Copiado!'; setTimeout(() => $('copy').textContent = 'Copiar link', 1500); };
+function copyText(t) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(t);
+  const a = document.createElement('textarea'); a.value = t; document.body.appendChild(a); a.select();
+  document.execCommand('copy'); a.remove();
+}
+$('copy').onclick = () => { copyText(location.href); $('copy').textContent = 'Copiado!'; setTimeout(() => $('copy').textContent = 'Copiar link', 1500); };
 $('form').onsubmit = (e) => { e.preventDefault(); const t = $('txt').value.trim(); if (t) send({ type: 'chat', text: t }); $('txt').value = ''; };
 </script>
 </body>
