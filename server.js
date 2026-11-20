@@ -19,15 +19,27 @@ const MIME = {
 const rooms = new Map();
 function getRoom(id) {
   if (!rooms.has(id)) {
-    rooms.set(id, { video: null, videoName: null, sub: false, state: { playing: false, time: 0, at: Date.now() }, clients: new Set() });
+    rooms.set(id, { video: null, videoName: null, vid: 0, sub: false, state: { playing: false, time: 0, at: Date.now() }, clients: new Set(), waiting: new Map() });
   }
   return rooms.get(id);
 }
 const validId = (id) => /^[a-z0-9]{4,32}$/.test(id);
 
-function currentTime(s) {
-  return s.playing ? s.time + (Date.now() - s.at) / 1000 : s.time;
+// state.playing é a intenção do grupo; o relógio só corre se ninguém estiver carregando (waiting vazio).
+function currentTime(room) {
+  const s = room.state;
+  return s.playing && room.waiting.size === 0 ? s.time + (Date.now() - s.at) / 1000 : s.time;
 }
+// Congela o relógio no instante atual; chamar antes de mudar room.waiting ou state.playing.
+function freeze(room) { room.state = { ...room.state, time: currentTime(room), at: Date.now() }; }
+function effective(room) {
+  return {
+    playing: room.state.playing && room.waiting.size === 0,
+    time: currentTime(room),
+    waiting: [...room.waiting.keys()].map((c) => c.nick),
+  };
+}
+function pushState(room, extra = {}) { broadcast(room, { type: 'state', state: effective(room), ...extra }); }
 
 function srtToVtt(srt) {
   return 'WEBVTT\n\n' + srt.replace(/\r/g, '').replace(/(\d+:\d+:\d+),(\d+)/g, '$1.$2');
@@ -101,9 +113,10 @@ const server = http.createServer((req, res) => {
     out.on('finish', () => {
       if (room.video && room.video !== dest) fs.unlink(room.video, () => {});
       fs.renameSync(tmp, dest);
-      room.video = dest; room.videoName = name;
+      room.video = dest; room.videoName = name; room.vid++;
+      room.waiting.clear();
       room.state = { playing: false, time: 0, at: Date.now() };
-      broadcast(room, { type: 'video', name, ext, state: room.state });
+      broadcast(room, { type: 'video', name, ext, vid: room.vid, state: effective(room) });
       res.writeHead(200); res.end('ok');
     });
     req.on('aborted', () => { out.destroy(); fs.unlink(tmp, () => {}); });
@@ -133,12 +146,14 @@ wss.on('connection', (ws, req) => {
   const room = getRoom(id);
   room.clients.add(ws);
   ws.nick = 'Anônimo';
-  const state = () => ({ ...room.state, time: currentTime(room.state), at: Date.now() });
+  ws.id = crypto.randomBytes(4).toString('hex');
+  ws.alive = true;
+  ws.on('pong', () => { ws.alive = true; });
   const sendCount = () => broadcast(room, { type: 'count', n: room.clients.size });
 
   ws.send(JSON.stringify({
-    type: 'init', hasVideo: !!room.video, name: room.videoName,
-    ext: room.video ? path.extname(room.video) : null, sub: room.sub, state: state(),
+    type: 'init', id: ws.id, hasVideo: !!room.video, name: room.videoName, vid: room.vid,
+    ext: room.video ? path.extname(room.video) : null, sub: room.sub, state: effective(room),
   }));
   sendCount();
 
@@ -146,19 +161,42 @@ wss.on('connection', (ws, req) => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
     if (msg.type === 'nick') { ws.nick = String(msg.nick || '').slice(0, 20) || 'Anônimo'; return; }
     if (msg.type === 'chat') { broadcast(room, { type: 'chat', nick: ws.nick, text: String(msg.text || '').slice(0, 500) }); return; }
-    if (msg.type === 'sync') { ws.send(JSON.stringify({ type: 'state', state: state() })); return; }
+    if (msg.type === 'sync') { ws.send(JSON.stringify({ type: 'state', reply: msg.t, state: effective(room) })); return; }
+    if (msg.type === 'buffering') {
+      if (!room.waiting.has(ws)) { freeze(room); room.waiting.set(ws, Date.now()); pushState(room); }
+      else room.waiting.set(ws, Date.now());
+      return;
+    }
+    if (msg.type === 'ready') {
+      if (room.waiting.has(ws)) { freeze(room); room.waiting.delete(ws); pushState(room); }
+      return;
+    }
     if (['play', 'pause', 'seek'].includes(msg.type)) {
       const time = Number(msg.time);
       if (!Number.isFinite(time)) return;
-      const playing = msg.type === 'play' ? true : msg.type === 'pause' ? false : room.state.playing;
-      room.state = { playing, time, at: Date.now() };
-      broadcast(room, { type: msg.type, time, nick: ws.nick, state: room.state }, ws);
+      freeze(room);
+      room.state = {
+        playing: msg.type === 'play' ? true : msg.type === 'pause' ? false : room.state.playing,
+        time, at: Date.now(),
+      };
+      // Todos recebem, inclusive quem enviou, para que o estado final seja idêntico.
+      broadcast(room, { type: msg.type, from: ws.id, nick: ws.nick, time, state: effective(room) });
     }
   });
   ws.on('close', () => {
     room.clients.delete(ws);
+    if (room.waiting.has(ws)) { freeze(room); room.waiting.delete(ws); pushState(room); }
     sendCount();
   });
 });
+
+// Quem trava carregando por mais de 20s não segura o grupo; conexões mortas são derrubadas.
+setInterval(() => {
+  for (const room of rooms.values()) {
+    const stale = [...room.waiting].filter(([, t]) => Date.now() - t > 20000);
+    if (stale.length) { freeze(room); stale.forEach(([c]) => room.waiting.delete(c)); pushState(room); }
+  }
+  for (const c of wss.clients) { if (!c.alive) { c.terminate(); continue; } c.alive = false; c.ping(); }
+}, 5000);
 
 server.listen(PORT, '0.0.0.0', () => console.log(`Watch Party em http://localhost:${PORT}`));

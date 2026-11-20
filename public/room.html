@@ -25,6 +25,9 @@
   #msgs b{color:#7aa2ff}
   #chat form{display:flex;gap:6px;padding:8px}
   #chat input{flex:1;min-width:0;background:#0f1115;border:1px solid #2a2f3a;color:#e8e8ea;border-radius:8px;padding:8px}
+  #wait,#gate{position:absolute;left:50%;transform:translateX(-50%);z-index:5}
+  #wait{top:12px;background:#000c;color:#fff;padding:8px 14px;border-radius:8px;font-size:.9rem}
+  #gate{top:50%;transform:translate(-50%,-50%);background:#e5484d;color:#fff;padding:16px 28px;font-size:1.1rem}
   .hidden{display:none!important}
   @media(max-width:720px){#layout{flex-direction:column}#chat{width:100%;height:30vh}}
 </style>
@@ -47,6 +50,8 @@
       <p id="status"></p>
       <progress id="bar" max="1" value="0" class="hidden"></progress>
     </div>
+    <div id="wait" class="hidden"></div>
+    <button id="gate" class="hidden">▶ Clique para entrar na sincronia</button>
     <video id="v" controls class="hidden" playsinline></video>
   </div>
   <aside id="chat">
@@ -62,15 +67,27 @@ const v = $('v');
 let nick = localStorage.getItem('wp-nick') || prompt('Seu nome:') || 'Anônimo';
 localStorage.setItem('wp-nick', nick);
 
-const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/?room=' + room);
-const send = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
-ws.onopen = () => send({ type: 'nick', nick });
+let ws, myId = null, curVid = null, rtt = 0, lastState = null;
+const send = (o) => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/?room=' + room);
+  ws.onopen = () => { send({ type: 'nick', nick }); $('count').style.opacity = 1; };
+  ws.onmessage = onMessage;
+  ws.onclose = () => { $('count').style.opacity = .4; $('count').textContent = 'reconectando…'; setTimeout(connect, 1000); };
+}
 
 // Evita eco: eventos disparados por comandos remotos não são reenviados.
-let remote = 0;
+let remote = 0, pendingSeek = false, seekTimer = null;
 function applyRemote(fn) {
   remote++;
-  Promise.resolve(fn()).catch(() => {}).finally(() => setTimeout(() => remote--, 300));
+  Promise.resolve(fn()).catch(() => {}).finally(() => setTimeout(() => remote--, 500));
+}
+function remoteSeek(t) {
+  pendingSeek = true;
+  clearTimeout(seekTimer);
+  seekTimer = setTimeout(() => (pendingSeek = false), 3000);
+  v.currentTime = t;
 }
 
 function log(text, cls) {
@@ -83,11 +100,13 @@ function log(text, cls) {
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmt = (t) => { t = Math.floor(t); return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0'); };
 
-function loadVideo(state) {
+function loadVideo(m) {
+  curVid = m.vid;
   $('upload').classList.add('hidden');
   v.classList.remove('hidden');
-  v.src = '/video/' + room + '?t=' + Date.now();
-  v.addEventListener('loadedmetadata', () => applyState(state), { once: true });
+  send({ type: 'buffering' }); // o grupo espera este cliente carregar
+  v.src = '/video/' + room + '?v=' + m.vid;
+  v.addEventListener('loadedmetadata', () => applyState(m.state, rtt / 2), { once: true });
 }
 function loadSub() {
   v.querySelectorAll('track').forEach((t) => t.remove());
@@ -96,41 +115,79 @@ function loadSub() {
   t.src = '/sub/' + room + '?t=' + Date.now();
   v.appendChild(t);
 }
-function applyState(s) {
-  const target = s.time;
+
+// Aplica o estado do grupo: posição corrigida pela latência, deriva pequena corrigida pela velocidade.
+function applyState(s, lat) {
+  lastState = s;
+  const w = $('wait');
+  if (s.waiting && s.waiting.length) { w.textContent = 'Aguardando ' + s.waiting.join(', ') + ' carregar…'; w.classList.remove('hidden'); }
+  else w.classList.add('hidden');
+  if (v.classList.contains('hidden') || !v.src) return;
+  const target = s.time + (s.playing ? lat : 0);
   applyRemote(async () => {
-    if (Math.abs(v.currentTime - target) > 0.3) v.currentTime = target;
-    if (s.playing && v.paused) await v.play();
-    if (!s.playing && !v.paused) v.pause();
+    const diff = target - v.currentTime;
+    if (!s.playing) {
+      v.playbackRate = 1;
+      if (!v.paused) v.pause();
+      if (Math.abs(diff) > 0.1) remoteSeek(target);
+      return;
+    }
+    if (Math.abs(diff) > 1 || (v.paused && Math.abs(diff) > 0.3)) { v.playbackRate = 1; remoteSeek(target); }
+    else if (Math.abs(diff) > 0.15) v.playbackRate = diff > 0 ? 1.06 : 0.94;
+    else v.playbackRate = 1;
+    if (v.paused) {
+      try { await v.play(); $('gate').classList.add('hidden'); }
+      catch (err) { if (err.name === 'NotAllowedError') $('gate').classList.remove('hidden'); }
+    }
   });
 }
+$('gate').onclick = () => { $('gate').classList.add('hidden'); v.play().then(() => send({ type: 'sync', t: Date.now() })).catch(() => {}); };
 
-ws.onmessage = (e) => {
+function onMessage(e) {
   const m = JSON.parse(e.data);
+  const lat = rtt / 2;
   switch (m.type) {
-    case 'init': if (m.hasVideo) loadVideo(m.state); if (m.sub) loadSub(); break;
-    case 'video': loadVideo(m.state); log('Novo vídeo: ' + esc(m.name), 'ev'); break;
+    case 'init':
+      myId = m.id;
+      if (m.hasVideo && m.vid !== curVid) loadVideo(m);
+      else if (m.hasVideo) { applyState(m.state, lat); if (v.readyState >= 3) send({ type: 'ready' }); } // reconexão
+      if (m.sub) loadSub();
+      break;
+    case 'video': loadVideo(m); log('Novo vídeo: ' + esc(m.name), 'ev'); break;
     case 'sub': loadSub(); log('Legenda carregada', 'ev'); break;
     case 'count': $('count').textContent = m.n + ' online'; break;
     case 'chat': log('<b>' + esc(m.nick) + ':</b> ' + esc(m.text)); break;
-    case 'play': log(esc(m.nick) + ' deu play em ' + fmt(m.time), 'ev'); applyState(m.state); break;
-    case 'pause': log(esc(m.nick) + ' pausou em ' + fmt(m.time), 'ev'); applyState(m.state); break;
-    case 'seek': log(esc(m.nick) + ' pulou para ' + fmt(m.time), 'ev'); applyState(m.state); break;
-    case 'state': applyState(m.state); break;
+    case 'play': case 'pause': case 'seek': {
+      if (m.from !== myId) {
+        const what = { play: 'deu play em ', pause: 'pausou em ', seek: 'pulou para ' }[m.type];
+        log(esc(m.nick) + ' ' + what + fmt(m.time), 'ev');
+      }
+      applyState(m.state, lat);
+      break;
+    }
+    case 'state':
+      if (m.reply) rtt = rtt ? rtt * 0.7 + (Date.now() - m.reply) * 0.3 : Date.now() - m.reply;
+      applyState(m.state, m.reply ? (Date.now() - m.reply) / 2 : lat);
+      break;
   }
-};
+}
 
 // Ações locais -> todos
 v.addEventListener('play', () => !remote && send({ type: 'play', time: v.currentTime }));
-v.addEventListener('pause', () => !remote && send({ type: 'pause', time: v.currentTime }));
-v.addEventListener('seeked', () => !remote && send({ type: 'seek', time: v.currentTime }));
-
-// Correção de deriva: se alguém ficou para trás (ex.: buffering), pede o estado.
-setInterval(() => { if (!v.classList.contains('hidden') && !v.paused) send({ type: 'sync' }); }, 5000);
-ws.addEventListener('message', (e) => {
-  const m = JSON.parse(e.data);
-  if (m.type === 'state' && m.state.playing && Math.abs(v.currentTime - m.state.time) > 1.5) applyState(m.state);
+v.addEventListener('pause', () => { if (!remote && !v.seeking) send({ type: 'pause', time: v.currentTime }); });
+v.addEventListener('seeked', () => {
+  if (pendingSeek) { pendingSeek = false; return; }
+  if (!remote) send({ type: 'seek', time: v.currentTime });
 });
+
+// Buffering: avisa o grupo para esperar; ao voltar, libera.
+v.addEventListener('waiting', () => send({ type: 'buffering' }));
+['canplay', 'playing', 'seeked'].forEach((ev) => v.addEventListener(ev, () => { if (v.readyState >= 3) send({ type: 'ready' }); }));
+
+// Verificação contínua: a cada 2s compara com o estado do grupo e corrige.
+setInterval(() => { if (!v.classList.contains('hidden') && v.src) send({ type: 'sync', t: Date.now() }); }, 2000);
+
+connect();
 
 // Upload
 function upload(file, kind) {
