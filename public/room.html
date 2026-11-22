@@ -77,11 +77,14 @@ function connect() {
   ws.onclose = () => { $('count').style.opacity = .4; $('count').textContent = 'reconectando…'; setTimeout(connect, 1000); };
 }
 
-// Evita eco: eventos disparados por comandos remotos não são reenviados.
-let remote = 0, pendingSeek = false, seekTimer = null;
-function applyRemote(fn) {
-  remote++;
-  Promise.resolve(fn()).catch(() => {}).finally(() => setTimeout(() => remote--, 500));
+// Evita eco: só o evento causado pelo próprio comando remoto é ignorado; ações da pessoa sempre valem.
+let expectPlay = false, expectPause = false, pendingSeek = false, seekTimer = null, quietPauseUntil = 0;
+function remotePause() { expectPause = true; v.pause(); }
+async function remotePlay() {
+  expectPlay = true;
+  try { await v.play(); }
+  // Play bloqueado pelo navegador pode gerar um "pause" logo em seguida; esse não vale como ação da pessoa.
+  catch (err) { expectPlay = false; quietPauseUntil = Date.now() + 500; throw err; }
 }
 function remoteSeek(t) {
   pendingSeek = true;
@@ -100,11 +103,33 @@ function log(text, cls) {
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmt = (t) => { t = Math.floor(t); return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0'); };
 
+// Carregamento: o grupo só espera este cliente quando ele está de fato sem vídeo para tocar.
+// "Pronto" exige alguns segundos já baixados à frente, para não voltar a travar logo em seguida.
+v.preload = 'auto';
+let buffering = false, stallTimer = null;
+function ahead() {
+  for (let i = 0; i < v.buffered.length; i++) {
+    if (v.buffered.start(i) <= v.currentTime + 0.2 && v.buffered.end(i) > v.currentTime) return v.buffered.end(i) - v.currentTime;
+  }
+  return 0;
+}
+function setBuffering(b) {
+  if (b === buffering) return;
+  buffering = b;
+  send({ type: b ? 'buffering' : 'ready' });
+}
+function checkReady() {
+  if (!buffering || !v.src || v.readyState < 2) return;
+  const atEnd = v.duration && v.currentTime + 0.5 >= v.duration;
+  if (v.readyState >= 4 || ahead() >= 4 || atEnd) setBuffering(false);
+}
+
 function loadVideo(m) {
   curVid = m.vid;
   $('upload').classList.add('hidden');
   v.classList.remove('hidden');
-  send({ type: 'buffering' }); // o grupo espera este cliente carregar
+  buffering = false;
+  setBuffering(true); // o grupo espera este cliente carregar
   v.src = '/video/' + room + '?v=' + m.vid;
   v.addEventListener('loadedmetadata', () => applyState(m.state, rtt / 2), { once: true });
 }
@@ -124,11 +149,11 @@ function applyState(s, lat) {
   else w.classList.add('hidden');
   if (v.classList.contains('hidden') || !v.src) return;
   const target = s.time + (s.playing ? lat : 0);
-  applyRemote(async () => {
+  (async () => {
     const diff = target - v.currentTime;
     if (!s.playing) {
       v.playbackRate = 1;
-      if (!v.paused) v.pause();
+      if (!v.paused) remotePause();
       // Em espera por buffering, tolera até 1s para não pular de volta e travar de novo (ciclo de buffering).
       if (Math.abs(diff) > (s.waiting && s.waiting.length ? 1 : 0.1)) remoteSeek(target);
       return;
@@ -137,10 +162,10 @@ function applyState(s, lat) {
     else if (Math.abs(diff) > 0.15) v.playbackRate = diff > 0 ? 1.06 : 0.94;
     else v.playbackRate = 1;
     if (v.paused) {
-      try { await v.play(); $('gate').classList.add('hidden'); }
+      try { await remotePlay(); $('gate').classList.add('hidden'); }
       catch (err) { if (err.name === 'NotAllowedError') $('gate').classList.remove('hidden'); }
     }
-  });
+  })();
 }
 $('gate').onclick = () => { $('gate').classList.add('hidden'); v.play().then(() => send({ type: 'sync', t: Date.now() })).catch(() => {}); };
 
@@ -151,7 +176,7 @@ function onMessage(e) {
     case 'init':
       myId = m.id;
       if (m.hasVideo && m.vid !== curVid) loadVideo(m);
-      else if (m.hasVideo) { applyState(m.state, lat); if (v.readyState >= 3) send({ type: 'ready' }); } // reconexão
+      else if (m.hasVideo) { applyState(m.state, lat); if (buffering) send({ type: 'buffering' }); } // reconexão
       if (m.sub) loadSub();
       break;
     case 'video': loadVideo(m); log('Novo vídeo: ' + esc(m.name), 'ev'); break;
@@ -174,16 +199,24 @@ function onMessage(e) {
 }
 
 // Ações locais -> todos
-v.addEventListener('play', () => !remote && send({ type: 'play', time: v.currentTime }));
-v.addEventListener('pause', () => { if (!remote && !v.seeking) send({ type: 'pause', time: v.currentTime }); });
+v.addEventListener('play', () => { if (expectPlay) { expectPlay = false; return; } send({ type: 'play', time: v.currentTime }); });
+v.addEventListener('pause', () => {
+  if (expectPause) { expectPause = false; return; }
+  if (!v.seeking && Date.now() > quietPauseUntil) send({ type: 'pause', time: v.currentTime });
+});
 v.addEventListener('seeked', () => {
   if (pendingSeek) { pendingSeek = false; return; }
-  if (!remote) send({ type: 'seek', time: v.currentTime });
+  send({ type: 'seek', time: v.currentTime });
 });
 
-// Buffering: avisa o grupo para esperar; ao voltar, libera.
-v.addEventListener('waiting', () => send({ type: 'buffering' }));
-['canplay', 'playing', 'seeked'].forEach((ev) => v.addEventListener(ev, () => { if (v.readyState >= 3) send({ type: 'ready' }); }));
+// Buffering: engasgo de menos de 1,5s não segura o grupo; acima disso, avisa e libera quando houver folga.
+v.addEventListener('waiting', () => {
+  clearTimeout(stallTimer);
+  stallTimer = setTimeout(() => { if (v.readyState < 3) setBuffering(true); }, 1500);
+});
+v.addEventListener('playing', () => clearTimeout(stallTimer));
+['canplay', 'canplaythrough', 'playing', 'seeked', 'progress', 'timeupdate'].forEach((ev) => v.addEventListener(ev, checkReady));
+setInterval(checkReady, 500);
 
 // Verificação contínua: a cada 2s compara com o estado do grupo e corrige.
 setInterval(() => { if (!v.classList.contains('hidden') && v.src) send({ type: 'sync', t: Date.now() }); }, 2000);

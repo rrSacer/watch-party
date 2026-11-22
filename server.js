@@ -2,6 +2,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
@@ -43,6 +44,17 @@ function pushState(room, extra = {}) { broadcast(room, { type: 'state', state: e
 
 function srtToVtt(srt) {
   return 'WEBVTT\n\n' + srt.replace(/\r/g, '').replace(/(\d+:\d+:\d+),(\d+)/g, '$1.$2');
+}
+
+// Move o índice do MP4 (moov) para o início, para o navegador começar a tocar sem baixar o fim do arquivo.
+// Sem ffmpeg, ou se falhar, segue com o arquivo original.
+function faststart(file, ext, done) {
+  if (!['.mp4', '.m4v'].includes(ext)) return done();
+  const out = file + '.fs.mp4';
+  execFile('ffmpeg', ['-v', 'error', '-y', '-i', file, '-map', '0', '-c', 'copy', '-movflags', '+faststart', out], (err) => {
+    if (err) { fs.unlink(out, () => {}); return done(); }
+    fs.rename(out, file, () => done());
+  });
 }
 
 function sendFile(req, res, file, type) {
@@ -110,7 +122,7 @@ const server = http.createServer((req, res) => {
     }
     const out = fs.createWriteStream(tmp);
     req.pipe(out);
-    out.on('finish', () => {
+    out.on('finish', () => faststart(tmp, ext, () => {
       if (room.video && room.video !== dest) fs.unlink(room.video, () => {});
       fs.renameSync(tmp, dest);
       room.video = dest; room.videoName = name; room.vid++;
@@ -118,7 +130,7 @@ const server = http.createServer((req, res) => {
       room.state = { playing: false, time: 0, at: Date.now() };
       broadcast(room, { type: 'video', name, ext, vid: room.vid, state: effective(room) });
       res.writeHead(200); res.end('ok');
-    });
+    }));
     req.on('aborted', () => { out.destroy(); fs.unlink(tmp, () => {}); });
     return;
   }
