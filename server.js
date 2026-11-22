@@ -6,7 +6,7 @@ const { execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const UPLOADS = path.join(__dirname, 'uploads');
+const UPLOADS = process.env.UPLOADS || path.join(__dirname, 'uploads');
 const PUBLIC = path.join(__dirname, 'public');
 fs.mkdirSync(UPLOADS, { recursive: true });
 
@@ -25,6 +25,14 @@ function getRoom(id) {
   return rooms.get(id);
 }
 const validId = (id) => /^[a-z0-9]{4,32}$/.test(id);
+// Vídeos já enviados continuam valendo depois de reiniciar o servidor.
+for (const f of fs.readdirSync(UPLOADS)) {
+  const m = /^([a-z0-9]{4,32})\.(mp4|m4v|webm|mkv|vtt)$/.exec(f);
+  if (!m) continue;
+  const room = getRoom(m[1]);
+  if (m[2] === 'vtt') room.sub = true;
+  else { room.video = path.join(UPLOADS, f); room.videoName = f; room.vid = 1; }
+}
 
 // state.playing é a intenção do grupo; o relógio só corre se ninguém estiver carregando (waiting vazio).
 function currentTime(room) {
@@ -183,16 +191,22 @@ wss.on('connection', (ws, req) => {
       if (room.waiting.has(ws)) { freeze(room); room.waiting.delete(ws); pushState(room); }
       return;
     }
-    if (['play', 'pause', 'seek'].includes(msg.type)) {
-      const time = Number(msg.time);
-      if (!Number.isFinite(time)) return;
+    // O relógio é do servidor: play e pause valem a partir da posição dele, nunca da posição de quem clicou.
+    // Assim, alguém atrasado ou adiantado não arrasta o grupo junto ao pausar ou dar play.
+    if (msg.type === 'play' || msg.type === 'pause') {
+      const want = msg.type === 'play';
+      if (room.state.playing === want) { ws.send(JSON.stringify({ type: 'state', ack: true, state: effective(room) })); return; }
       freeze(room);
-      room.state = {
-        playing: msg.type === 'play' ? true : msg.type === 'pause' ? false : room.state.playing,
-        time, at: Date.now(),
-      };
-      // Todos recebem, inclusive quem enviou, para que o estado final seja idêntico.
-      broadcast(room, { type: msg.type, from: ws.id, nick: ws.nick, time, state: effective(room) });
+      room.state = { ...room.state, playing: want };
+      broadcast(room, { type: msg.type, from: ws.id, nick: ws.nick, time: room.state.time, state: effective(room) });
+      return;
+    }
+    // Só o pulo usa a posição enviada por quem pulou.
+    if (msg.type === 'seek') {
+      const time = Math.max(0, Number(msg.time));
+      if (!Number.isFinite(time)) return;
+      room.state = { playing: room.state.playing, time, at: Date.now() };
+      broadcast(room, { type: 'seek', from: ws.id, nick: ws.nick, n: msg.n, time, state: effective(room) });
     }
   });
   ws.on('close', () => {
@@ -202,10 +216,10 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Quem trava carregando por mais de 20s não segura o grupo; conexões mortas são derrubadas.
+// Quem trava carregando por mais de 30s não segura o grupo; conexões mortas são derrubadas.
 setInterval(() => {
   for (const room of rooms.values()) {
-    const stale = [...room.waiting].filter(([, t]) => Date.now() - t > 20000);
+    const stale = [...room.waiting].filter(([, t]) => Date.now() - t > 30000);
     if (stale.length) { freeze(room); stale.forEach(([c]) => room.waiting.delete(c)); pushState(room); }
   }
   for (const c of wss.clients) { if (!c.alive) { c.terminate(); continue; } c.alive = false; c.ping(); }

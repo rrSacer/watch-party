@@ -77,8 +77,11 @@ function connect() {
   ws.onclose = () => { $('count').style.opacity = .4; $('count').textContent = 'reconectando…'; setTimeout(connect, 1000); };
 }
 
-// Evita eco: só o evento causado pelo próprio comando remoto é ignorado; ações da pessoa sempre valem.
-let expectPlay = false, expectPause = false, pendingSeek = false, seekTimer = null, quietPauseUntil = 0;
+// --- Sincronização ---
+// O servidor é o dono do relógio. Daqui só saem intenções (play, pause, pular); a posição vem sempre dele.
+
+// Eco: o evento causado por um comando do servidor é ignorado; o que a pessoa faz sempre vale.
+let expectPlay = false, expectPause = false, quietPauseUntil = 0;
 function remotePause() { expectPause = true; v.pause(); }
 async function remotePlay() {
   expectPlay = true;
@@ -86,11 +89,31 @@ async function remotePlay() {
   // Play bloqueado pelo navegador pode gerar um "pause" logo em seguida; esse não vale como ação da pessoa.
   catch (err) { expectPlay = false; quietPauseUntil = Date.now() + 500; throw err; }
 }
+
+// Depois de a pessoa dar play ou pause, as respostas periódicas são ignoradas até o servidor confirmar,
+// para o vídeo não piscar de volta ao estado anterior.
+let intentAt = 0;
+const intentPending = () => Date.now() - intentAt < 1500;
+function sendIntent(type) { intentAt = Date.now(); send({ type }); }
+
+// Pulos: cada pulo pedido por este código é contado; qualquer outro pulo é da pessoa.
+let pendingRemote = 0, remoteTarget = 0, seekStart = 0, seekCost = 0.3;
+let localSeek = false, seekN = 0, seekSendTimer = null, seekSentAt = 0;
 function remoteSeek(t) {
-  pendingSeek = true;
-  clearTimeout(seekTimer);
-  seekTimer = setTimeout(() => (pendingSeek = false), 3000);
+  if (v.duration) t = Math.min(t, Math.max(0, v.duration - 0.25));
+  pendingRemote++; remoteTarget = t; seekStart = performance.now();
   v.currentTime = t;
+}
+// Enquanto a pessoa arrasta a barra (e até o servidor confirmar o pulo), a posição dela não é corrigida.
+const seekHold = () => localSeek && (seekSendTimer !== null || Date.now() - seekSentAt < 3000);
+function userSeek() {
+  localSeek = true;
+  clearTimeout(seekSendTimer);
+  // Arrastar a barra gera muitos pulos seguidos; só o último é enviado.
+  seekSendTimer = setTimeout(() => {
+    seekSendTimer = null; seekSentAt = Date.now();
+    send({ type: 'seek', time: v.currentTime, n: ++seekN });
+  }, 250);
 }
 
 function log(text, cls) {
@@ -106,7 +129,7 @@ const fmt = (t) => { t = Math.floor(t); return Math.floor(t / 60) + ':' + String
 // Carregamento: o grupo só espera este cliente quando ele está de fato sem vídeo para tocar.
 // "Pronto" exige alguns segundos já baixados à frente, para não voltar a travar logo em seguida.
 v.preload = 'auto';
-let buffering = false, stallTimer = null;
+let buffering = false, stallTimer = null, need = 3, lastStall = 0;
 function ahead() {
   for (let i = 0; i < v.buffered.length; i++) {
     if (v.buffered.start(i) <= v.currentTime + 0.2 && v.buffered.end(i) > v.currentTime) return v.buffered.end(i) - v.currentTime;
@@ -119,20 +142,22 @@ function setBuffering(b) {
   send({ type: b ? 'buffering' : 'ready' });
 }
 function checkReady() {
-  if (!buffering || !v.src || v.readyState < 2) return;
-  const atEnd = v.duration && v.currentTime + 0.5 >= v.duration;
-  if (v.readyState >= 4 || ahead() >= 4 || atEnd) setBuffering(false);
+  if (!buffering || !v.src || v.seeking || v.readyState < 2) return;
+  const a = ahead();
+  if (a >= need || (v.duration && v.currentTime + a >= v.duration - 0.5)) setBuffering(false);
 }
 
 function loadVideo(m) {
   curVid = m.vid;
+  lastState = m.state;
   $('upload').classList.add('hidden');
   v.classList.remove('hidden');
-  buffering = false;
+  buffering = false; need = 3;
   setBuffering(true); // o grupo espera este cliente carregar
   v.src = '/video/' + room + '?v=' + m.vid;
-  v.addEventListener('loadedmetadata', () => applyState(m.state, rtt / 2), { once: true });
 }
+// Com o vídeo aberto, pede a posição atual do grupo (a que veio junto com o aviso já está velha).
+v.addEventListener('loadedmetadata', () => send({ type: 'sync', t: Date.now() }));
 function loadSub() {
   v.querySelectorAll('track').forEach((t) => t.remove());
   const t = document.createElement('track');
@@ -141,37 +166,41 @@ function loadSub() {
   v.appendChild(t);
 }
 
-// Aplica o estado do grupo: posição corrigida pela latência, deriva pequena corrigida pela velocidade.
+// Aplica o estado do grupo. lat = atraso da rede em SEGUNDOS, somado só quando o vídeo está tocando.
 function applyState(s, lat) {
   lastState = s;
   const w = $('wait');
   if (s.waiting && s.waiting.length) { w.textContent = 'Aguardando ' + s.waiting.join(', ') + ' carregar…'; w.classList.remove('hidden'); }
   else w.classList.add('hidden');
-  if (v.classList.contains('hidden') || !v.src) return;
-  const target = s.time + (s.playing ? lat : 0);
-  (async () => {
-    const diff = target - v.currentTime;
-    if (!s.playing) {
-      v.playbackRate = 1;
-      if (!v.paused) remotePause();
-      // Em espera por buffering, tolera até 1s para não pular de volta e travar de novo (ciclo de buffering).
-      if (Math.abs(diff) > (s.waiting && s.waiting.length ? 1 : 0.1)) remoteSeek(target);
-      return;
-    }
-    if (Math.abs(diff) > 1) { v.playbackRate = 1; remoteSeek(target); }
-    else if (Math.abs(diff) > 0.15) v.playbackRate = diff > 0 ? 1.06 : 0.94;
-    else v.playbackRate = 1;
-    if (v.paused) {
-      try { await remotePlay(); $('gate').classList.add('hidden'); }
-      catch (err) { if (err.name === 'NotAllowedError') $('gate').classList.remove('hidden'); }
-    }
-  })();
+  if (v.classList.contains('hidden') || !v.src || v.readyState < 1) return;
+  const hold = seekHold();
+  if (!s.playing) {
+    v.playbackRate = 1;
+    if (!v.paused) remotePause();
+    // Tolerância de 0,5s: com rede lenta o aviso de pausa chega atrasado, e não vale a pena voltar o vídeo por isso.
+    if (!hold && Math.abs(s.time - v.currentTime) > 0.5) remoteSeek(s.time);
+    return;
+  }
+  const target = s.time + lat;
+  const diff = target - v.currentTime;
+  if (hold) { /* a pessoa está pulando: não mexe na posição */ }
+  // Pulo em andamento: espera terminar, a menos que o grupo já esteja em outro trecho.
+  else if (v.seeking) { if (diff < -1 || diff > 6) remoteSeek(target + seekCost); }
+  // Diferença grande: pula, já contando o tempo que o próprio pulo leva.
+  else if (Math.abs(diff) > 1) { v.playbackRate = 1; remoteSeek(target + seekCost); }
+  // Diferença pequena: acelera ou desacelera até 10%, sem pulo.
+  else v.playbackRate = Math.abs(diff) < 0.08 ? 1 : 1 + Math.max(-0.1, Math.min(0.1, diff * 0.3));
+  if (v.paused) {
+    remotePlay().then(() => $('gate').classList.add('hidden'))
+      .catch((err) => { if (err.name === 'NotAllowedError') $('gate').classList.remove('hidden'); });
+  }
 }
-$('gate').onclick = () => { $('gate').classList.add('hidden'); v.play().then(() => send({ type: 'sync', t: Date.now() })).catch(() => {}); };
+// Navegador bloqueou o play automático: o clique só libera o vídeo neste aparelho, não mexe no grupo.
+$('gate').onclick = () => { $('gate').classList.add('hidden'); remotePlay().then(() => send({ type: 'sync', t: Date.now() })).catch(() => {}); };
 
 function onMessage(e) {
   const m = JSON.parse(e.data);
-  const lat = rtt / 2;
+  const lat = rtt / 2000;
   switch (m.type) {
     case 'init':
       myId = m.id;
@@ -188,37 +217,64 @@ function onMessage(e) {
         const what = { play: 'deu play em ', pause: 'pausou em ', seek: 'pulou para ' }[m.type];
         log(esc(m.nick) + ' ' + what + fmt(m.time), 'ev');
       }
+      if (m.type !== 'seek') intentAt = 0;
+      else if (m.from === myId && m.n === seekN && seekSendTimer === null) localSeek = false;
       applyState(m.state, lat);
       break;
     }
-    case 'state':
-      if (m.reply) rtt = rtt ? rtt * 0.7 + (Date.now() - m.reply) * 0.3 : Date.now() - m.reply;
-      applyState(m.state, m.reply ? (Date.now() - m.reply) / 2 : lat);
+    case 'state': {
+      if (m.ack) intentAt = 0;
+      if (!m.reply) { applyState(m.state, lat); break; }
+      const sample = Date.now() - m.reply; // ida e volta, em milissegundos
+      const late = rtt && sample > 2 * rtt + 150; // resposta atrasada: a posição nela já está velha
+      rtt = rtt ? rtt * 0.7 + sample * 0.3 : sample;
+      if (!late && !intentPending()) applyState(m.state, sample / 2000);
       break;
+    }
   }
 }
 
-// Ações locais -> todos
-v.addEventListener('play', () => { if (expectPlay) { expectPlay = false; return; } send({ type: 'play', time: v.currentTime }); });
+// Ações da pessoa -> servidor
+v.addEventListener('play', () => {
+  if (expectPlay) { expectPlay = false; return; }
+  // Grupo já tocando (ex.: este aparelho estava parado sozinho): só realinha, sem mexer nos outros.
+  if (lastState && lastState.playing) send({ type: 'sync', t: Date.now() });
+  else sendIntent('play');
+});
 v.addEventListener('pause', () => {
   if (expectPause) { expectPause = false; return; }
-  if (!v.seeking && Date.now() > quietPauseUntil) send({ type: 'pause', time: v.currentTime });
+  if (v.seeking || Date.now() <= quietPauseUntil) return;
+  if (lastState && lastState.playing) sendIntent('pause');
+});
+v.addEventListener('seeking', () => {
+  if (pendingRemote > 0 && Math.abs(v.currentTime - remoteTarget) < 0.3) pendingRemote--;
+  else userSeek();
+  if (ahead() < 1) setBuffering(true); // trecho ainda não baixado: o grupo espera
 });
 v.addEventListener('seeked', () => {
-  if (pendingSeek) { pendingSeek = false; return; }
-  send({ type: 'seek', time: v.currentTime });
+  if (v.seeking) return;
+  pendingRemote = 0;
+  if (seekStart && !v.paused) seekCost = Math.min(3, seekCost * 0.5 + (performance.now() - seekStart) / 2000);
+  seekStart = 0;
 });
 
-// Buffering: engasgo de menos de 1,5s não segura o grupo; acima disso, avisa e libera quando houver folga.
+// Engasgo de menos de 1,2s não segura o grupo. Acima disso, avisa e só libera com folga baixada;
+// se os engasgos se repetem, a folga exigida dobra (até 24s) para pausar menos vezes.
 v.addEventListener('waiting', () => {
   clearTimeout(stallTimer);
-  stallTimer = setTimeout(() => { if (v.readyState < 3) setBuffering(true); }, 1500);
+  stallTimer = setTimeout(() => {
+    if (v.paused || v.readyState >= 3 || buffering) return;
+    const now = Date.now();
+    need = now - lastStall < 90000 ? Math.min(need * 2, 24) : 3;
+    lastStall = now;
+    setBuffering(true);
+  }, 1200);
 });
 v.addEventListener('playing', () => clearTimeout(stallTimer));
 ['canplay', 'canplaythrough', 'playing', 'seeked', 'progress', 'timeupdate'].forEach((ev) => v.addEventListener(ev, checkReady));
 setInterval(checkReady, 500);
 
-// Verificação contínua: a cada 2s compara com o estado do grupo e corrige.
+// Verificação contínua: a cada 2s compara com o relógio do servidor e corrige.
 setInterval(() => { if (!v.classList.contains('hidden') && v.src) send({ type: 'sync', t: Date.now() }); }, 2000);
 
 connect();

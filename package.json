@@ -1,14 +1,18 @@
 {
   "name": "watch-party",
   "version": "1.0.0",
-  "description": "",
+  "description": "Assistir vídeos sincronizados com amigos pelo navegador",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test:sync": "node test/acoes.js && node test/rede-instavel.js && node test/play-bloqueado.js"
   },
   "keywords": [],
   "type": "commonjs",
   "dependencies": {
     "ws": "^8.23.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.65.1"
   }
 }
